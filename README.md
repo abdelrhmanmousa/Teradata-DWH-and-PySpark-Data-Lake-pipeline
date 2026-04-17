@@ -203,4 +203,4 @@ This repository now separates:
 - staging and warehouse SQL in `sql`
 - data lake logic in `spark`
 
-The goal is to make the project cleaner for GitHub and easier to present during the interview, while keeping the source pictures, model design, and implementation connected in one place.
+
