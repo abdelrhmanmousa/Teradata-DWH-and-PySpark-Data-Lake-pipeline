@@ -1,0 +1,139 @@
+-- SCD Type 2 load for DIM_PERSON
+UPDATE DIM_PERSON AS d
+FROM STG_PERSON_PROFILE AS s
+SET end_date   = s.eff_date - INTERVAL '1' DAY,
+    is_current = 0
+WHERE d.person_id = s.person_id
+  AND d.is_current = 1
+  AND d.person_name <> s.person_name
+  AND s.eff_date > d.start_date;
+
+INSERT INTO DIM_PERSON (person_id, person_name, start_date, end_date, is_current)
+SELECT
+    s.person_id,
+    s.person_name,
+    s.eff_date,
+    DATE '9999-12-31',
+    1
+FROM STG_PERSON_PROFILE AS s
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM DIM_PERSON AS d
+    WHERE d.person_id = s.person_id
+      AND d.start_date = s.eff_date
+      AND d.person_name = s.person_name
+);
+
+
+-- SCD Type 2 load for DIM_ACCOUNT
+UPDATE DIM_ACCOUNT AS d
+FROM (
+    SELECT
+        a.acc_no,
+        a.eff_date,
+        a.acc_status,
+        ad.acc_type
+    FROM STG_ACCOUNTS AS a
+    JOIN STG_ACCOUNT_DETAILS AS ad
+      ON a.acc_no = ad.acc_no
+     AND a.eff_date = ad.eff_date
+) AS s
+SET end_date   = s.eff_date - INTERVAL '1' DAY,
+    is_current = 0
+WHERE d.acc_no = s.acc_no
+  AND d.is_current = 1
+  AND s.eff_date > d.start_date
+  AND (
+      d.acc_status <> s.acc_status
+      OR d.acc_type <> s.acc_type
+  );
+
+INSERT INTO DIM_ACCOUNT (acc_no, acc_status, acc_type, start_date, end_date, is_current)
+SELECT
+    s.acc_no,
+    s.acc_status,
+    s.acc_type,
+    s.eff_date,
+    DATE '9999-12-31',
+    1
+FROM (
+    SELECT
+        a.acc_no,
+        a.eff_date,
+        a.acc_status,
+        ad.acc_type
+    FROM STG_ACCOUNTS AS a
+    JOIN STG_ACCOUNT_DETAILS AS ad
+      ON a.acc_no = ad.acc_no
+     AND a.eff_date = ad.eff_date
+) AS s
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM DIM_ACCOUNT AS d
+    WHERE d.acc_no = s.acc_no
+      AND d.start_date = s.eff_date
+      AND d.acc_status = s.acc_status
+      AND d.acc_type = s.acc_type
+);
+
+
+-- Bridge load from current dimension versions
+INSERT INTO BRIDGE_PERSON_ACCOUNT (person_sk, account_sk)
+SELECT DISTINCT
+    p.person_sk,
+    a.account_sk
+FROM STG_PERSON AS s
+JOIN DIM_PERSON AS p
+  ON s.person_id = p.person_id
+ AND p.is_current = 1
+JOIN DIM_ACCOUNT AS a
+  ON s.acc_no = a.acc_no
+ AND a.is_current = 1
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM BRIDGE_PERSON_ACCOUNT AS b
+    WHERE b.person_sk = p.person_sk
+      AND b.account_sk = a.account_sk
+);
+
+
+-- Person identification history
+INSERT INTO DIM_PERSON_IDEN (person_sk, id_value, id_type, start_date)
+SELECT
+    p.person_sk,
+    s.id_value,
+    CASE
+        WHEN UPPER(s.id_value) LIKE '%NID%' THEN 'NID'
+        WHEN UPPER(s.id_value) LIKE '%PASS%' THEN 'PASSPORT'
+        ELSE 'OTHER'
+    END AS id_type,
+    s.eff_date
+FROM STG_PERSON_IDEN AS s
+JOIN DIM_PERSON AS p
+  ON s.person_id = p.person_id
+ AND s.eff_date BETWEEN p.start_date AND p.end_date
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM DIM_PERSON_IDEN AS i
+    WHERE i.person_sk = p.person_sk
+      AND i.id_value = s.id_value
+      AND i.start_date = s.eff_date
+);
+
+
+-- Snapshot fact for current active dimension rows
+INSERT INTO FACT_ACCOUNT_SNAPSHOT (date_sk, person_sk, account_sk, status_flag)
+SELECT
+    d.date_sk,
+    b.person_sk,
+    b.account_sk,
+    CASE WHEN UPPER(a.acc_status) = 'ACTIVE' THEN 1 ELSE 0 END AS status_flag
+FROM BRIDGE_PERSON_ACCOUNT AS b
+JOIN DIM_PERSON AS p
+  ON b.person_sk = p.person_sk
+JOIN DIM_ACCOUNT AS a
+  ON b.account_sk = a.account_sk
+JOIN DIM_DATE AS d
+  ON d.full_date = CURRENT_DATE
+WHERE CURRENT_DATE BETWEEN p.start_date AND p.end_date
+  AND CURRENT_DATE BETWEEN a.start_date AND a.end_date;
