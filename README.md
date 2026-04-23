@@ -1,5 +1,7 @@
 # Teradata DWH and PySpark Data Lake pipeline
 
+For the complete repository documentation, see [Full Project Documentation](docs/PROJECT_DOCUMENTATION.md).
+
 This repository contains my solution for an dataflow task with two parts:
 
 - Build a Data Warehouse using SQL
@@ -202,5 +204,4 @@ This repository now separates:
 - design artifacts in `docs/diagrams` and `sql/design`
 - staging and warehouse SQL in `sql`
 - data lake logic in `spark`
-
 

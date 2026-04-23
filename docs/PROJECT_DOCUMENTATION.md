@@ -1,0 +1,561 @@
+# Project Documentation
+
+## 1. Overview
+
+This repository contains a complete solution for a banking-style data engineering use case with two delivery tracks:
+
+- a Teradata-style SQL data warehouse implementation
+- a PySpark data lake implementation
+
+The goal is to take a set of historical source tables, preserve history correctly, and publish analytics-ready structures that support current-state and snapshot-style reporting.
+
+The solution is organized around the following ideas:
+
+- source data contains history for accounts, account details, people, and person identifiers
+- historical changes are modeled using Slowly Changing Dimension Type 2 (SCD Type 2) rules
+- the SQL implementation builds a dimensional warehouse
+- the PySpark implementation builds raw, curated, and gold layers in a medallion-style lakehouse flow
+
+This document is intended to be the single complete technical reference for the repository.
+
+## 2. Business Problem
+
+The source image described in the task includes five operational tables:
+
+1. `Accounts`
+   - columns: `Acc no`, `Date`, `Status`
+2. `Account Details`
+   - columns: `Acc no`, `Date`, `type`
+3. `Person`
+   - columns: `Acc no`, `Person`
+4. `Person Profile`
+   - columns: `Person`, `Name`, `Date`
+5. `Person Iden`
+   - columns: `Person`, `Id`, `Date`
+
+The size note in the task image indicates:
+
+- `Accounts`: `3T`
+- `Account Details`: `2T`
+- `Person`: `1T`
+- `Person Profile`: `1T`
+- `Person Iden`: `3T`
+
+These tables represent:
+
+- account status history
+- account type history
+- the relationship between people and accounts
+- person name/profile history
+- person identification history
+
+Because several attributes change over time, the main design challenge is preserving business history without losing the current view of each entity.
+
+## 3. Repository Structure
+
+```text
+.
+├── docs
+│   ├── PROJECT_DOCUMENTATION.md
+│   └── diagrams
+│       ├── ERD.png
+│       ├── LDM.png
+│       ├── Relational Schema - PDM.png
+│       └── pipeline.png
+├── spark
+│   └── pyspark_build_datalake.py
+├── sql
+│   ├── design
+│   │   └── PDM.sql
+│   ├── staging
+│   │   └── stg-teradata.sql
+│   └── warehouse
+│       ├── DW.sql
+│       └── ELT-STG_TO_Dim_fact
+└── README.md
+```
+
+## 4. Design Artifacts
+
+### 4.1 LDM
+
+The logical data model shows the business-level entities and relationships.
+
+![LDM](diagrams/LDM.png)
+
+### 4.2 ERD
+
+The entity relationship diagram shows the target warehouse entities and their relationships.
+
+![ERD](diagrams/ERD.png)
+
+### 4.3 PDM
+
+The physical data model shows the relational implementation pattern used by the solution.
+
+![PDM](diagrams/Relational%20Schema%20-%20PDM.png)
+
+The SQL design artifact is also included in:
+
+- `sql/design/PDM.sql`
+
+### 4.4 Pipeline
+
+The pipeline diagram summarizes the movement from source ingestion to curated and analytical layers.
+
+![Pipeline](diagrams/pipeline.png)
+
+## 5. End-to-End Architecture
+
+The repository contains two parallel implementations of the same business logic.
+
+### 5.1 SQL Warehouse Path
+
+The SQL path follows this sequence:
+
+1. create staging tables in Teradata-style SQL
+2. load source data into staging
+3. create warehouse tables
+4. run ELT logic to populate dimensions, bridge tables, and fact tables
+
+Files involved:
+
+- `sql/staging/stg-teradata.sql`
+- `sql/warehouse/DW.sql`
+- `sql/warehouse/ELT-STG_TO_Dim_fact`
+
+### 5.2 PySpark Data Lake Path
+
+The PySpark path follows a medallion-style flow:
+
+1. read source tables over JDBC
+2. write raw copies to HDFS
+3. standardize and deduplicate data into curated outputs
+4. build gold dimensions, bridge, and fact outputs
+5. publish the final gold tables with Hive support
+
+File involved:
+
+- `spark/pyspark_build_datalake.py`
+
+## 6. SQL Implementation
+
+## 6.1 Staging Layer
+
+The staging script is:
+
+- `sql/staging/stg-teradata.sql`
+
+It creates these staging tables:
+
+- `STG_ACCOUNTS`
+- `STG_ACCOUNT_DETAILS`
+- `STG_PERSON`
+- `STG_PERSON_PROFILE`
+- `STG_PERSON_IDEN`
+
+Key characteristics:
+
+- staging stores source-shaped business data
+- effective dates are stored as `eff_date`
+- Teradata `MULTISET TABLE` syntax is used
+- primary indexes are defined on the main join key columns
+
+Current implementation details visible in the file:
+
+- `STG_PERSON.person_id` is defined as `CHAR(1)`
+- `STG_PERSON_PROFILE.person_id` is defined as `CHAR(1)`
+- `STG_PERSON_IDEN.person_id` is defined as `CHAR(1)`
+
+This suggests the example assumes very short person identifiers, which may be acceptable for the assignment but would likely need revision for production-scale data.
+
+## 6.2 Warehouse Layer
+
+The warehouse DDL script is:
+
+- `sql/warehouse/DW.sql`
+
+It creates the following analytical tables:
+
+- `DIM_PERSON`
+- `DIM_ACCOUNT`
+- `DIM_DATE`
+- `DIM_PERSON_IDEN`
+- `BRIDGE_PERSON_ACCOUNT`
+- `FACT_ACCOUNT_SNAPSHOT`
+
+Key design choices from the script:
+
+- `DIM_PERSON`, `DIM_ACCOUNT`, and `DIM_PERSON_IDEN` use surrogate keys generated by identity columns
+- dimensions use `start_date`, `end_date`, and `is_current`
+- open-ended rows use `9999-12-31`
+- partitioning is defined for major history-bearing tables
+- `FACT_ACCOUNT_SNAPSHOT` is partitioned by `date_sk`
+
+Notable dimensional model behavior:
+
+- `DIM_PERSON` tracks person name history
+- `DIM_ACCOUNT` tracks account status and account type history
+- `DIM_PERSON_IDEN` stores identifier values and a derived identifier type
+- `BRIDGE_PERSON_ACCOUNT` resolves the many-to-many relationship between people and accounts
+- `FACT_ACCOUNT_SNAPSHOT` stores a point-in-time view based on current date
+
+## 6.3 ELT Logic
+
+The load script is:
+
+- `sql/warehouse/ELT-STG_TO_Dim_fact`
+
+It performs the following transformations:
+
+- SCD Type 2 updates and inserts into `DIM_PERSON`
+- SCD Type 2 updates and inserts into `DIM_ACCOUNT`
+- current-row bridge loading into `BRIDGE_PERSON_ACCOUNT`
+- historical identifier loading into `DIM_PERSON_IDEN`
+- current-date snapshot loading into `FACT_ACCOUNT_SNAPSHOT`
+
+Important implementation realities:
+
+- person history changes are detected when `person_name` changes for the same `person_id`
+- account history changes are detected when either `acc_status` or `acc_type` changes for the same `acc_no`
+- existing rows are closed using `eff_date - 1 day`
+- new current rows are inserted with `end_date = DATE '9999-12-31'`
+- bridge rows are resolved from current versions of person and account dimensions only
+- the snapshot fact uses `CURRENT_DATE`
+- `status_flag` is derived as `1` when account status is `ACTIVE`, otherwise `0`
+
+## 7. PySpark Implementation
+
+The PySpark implementation is in:
+
+- `spark/pyspark_build_datalake.py`
+
+The script creates a Spark session with Hive support and reads source tables through JDBC.
+
+### 7.1 Runtime Configuration Present in Code
+
+The current script includes hardcoded configuration values:
+
+- JDBC URL: `jdbc:oracle:thin:@//source-db:1521/BANKDB`
+- JDBC driver: `oracle.jdbc.OracleDriver`
+- app name: `DataLake_Banking`
+- raw base path: `hdfs:///datalake/raw`
+- curated base path: `hdfs:///datalake/curated`
+- gold base path: `hdfs:///datalake/gold`
+- open-end date: `9999-12-31`
+
+This means the Spark implementation currently assumes:
+
+- an Oracle source system
+- HDFS storage
+- Hive metastore availability
+- the Oracle JDBC driver is present in the Spark runtime
+
+### 7.2 Raw Zone
+
+The raw ingestion step reads:
+
+- `ACCOUNTS`
+- `ACCOUNT_DETAILS`
+- `PERSON`
+- `PERSON_PROFILE`
+- `PERSON_IDEN`
+
+Read behavior:
+
+- large tables use partitioned JDBC reads through `read_large`
+- small tables use standard JDBC reads through `read_small`
+
+Raw outputs:
+
+- `accounts` written as ORC partitioned by `DATE`
+- `account_details` written as ORC partitioned by `DATE`
+- `person` written as ORC
+- `person_profile` written as ORC partitioned by `DATE`
+- `person_iden` written as ORC partitioned by `DATE`
+
+### 7.3 Curated Zone
+
+The curated layer standardizes names, normalizes dates, trims values, and removes duplicates.
+
+Curated outputs:
+
+- `accounts`
+- `account_details`
+- `person`
+- `person_profile`
+- `person_iden`
+
+Important transformation rules:
+
+- source date columns are converted to Spark `date`
+- source columns are renamed to normalized snake_case names
+- duplicate rows are dropped on business-specific column sets
+- person-account relationships are deduplicated
+- `id_value` is derived by removing text in parentheses from the source `ID`
+- `id_type` is derived using string matching:
+  - contains `NID` -> `NID`
+  - contains `PASS` -> `PASSPORT`
+  - otherwise -> `OTHER`
+
+Curated storage format:
+
+- Parquet
+
+### 7.4 Gold Zone
+
+The gold layer builds dimensional outputs consistent with the warehouse model.
+
+Gold outputs:
+
+- `gold.dim_person`
+- `gold.dim_account`
+- `gold.dim_person_iden`
+- `gold.bridge_person_account`
+- `gold.fact_account_snapshot`
+
+Gold construction logic:
+
+- `build_scd2` is used to generate versioned history rows
+- `dim_person` tracks name changes by `person_id`
+- `dim_account` tracks account status and account type changes by `acc_no`
+- surrogate keys are generated with `row_number()`
+- person identifiers are matched to the correct dimension version using effective date containment
+- the person-account bridge uses only current dimension rows
+- the snapshot fact uses `current_date()`
+
+Fact behavior in code:
+
+- `snapshot_date` is set to the Spark runtime current date
+- `date_sk` is generated as `yyyyMMdd`
+- `status_flag` is `1` when account status is `ACTIVE`, else `0`
+- fact output is partitioned by `snapshot_date`
+
+## 8. SCD Type 2 Rules
+
+The warehouse and Spark implementations both follow the same historical principles.
+
+### 8.1 Common Rules
+
+- natural keys are preserved from the source
+- surrogate keys are introduced in the analytical layer
+- a new dimension row is created when tracked attributes change
+- old rows are closed with the day before the next effective date
+- current rows remain open with an end date of `9999-12-31`
+- `is_current = 1` identifies the latest active row
+
+### 8.2 `DIM_PERSON`
+
+Business key:
+
+- `person_id`
+
+Tracked attribute:
+
+- `person_name`
+
+Change rule:
+
+- when a person name changes for the same business key, close the previous row and insert a new row
+
+### 8.3 `DIM_ACCOUNT`
+
+Business key:
+
+- `acc_no`
+
+Tracked attributes:
+
+- `acc_status`
+- `acc_type`
+
+Change rule:
+
+- when either status or type changes for the same account, close the previous row and insert a new row
+
+## 9. Target Model Summary
+
+### 9.1 `DIM_PERSON`
+
+Purpose:
+
+- stores versioned person attributes
+
+Main columns:
+
+- `person_sk`
+- `person_id`
+- `person_name`
+- `start_date`
+- `end_date`
+- `is_current`
+
+### 9.2 `DIM_ACCOUNT`
+
+Purpose:
+
+- stores versioned account status and account type
+
+Main columns:
+
+- `account_sk`
+- `acc_no`
+- `acc_status`
+- `acc_type`
+- `start_date`
+- `end_date`
+- `is_current`
+
+### 9.3 `DIM_PERSON_IDEN`
+
+Purpose:
+
+- stores person identifier history by resolved person surrogate key
+
+Main columns:
+
+- `iden_sk`
+- `person_sk`
+- `id_value`
+- `id_type`
+- `start_date`
+
+### 9.4 `BRIDGE_PERSON_ACCOUNT`
+
+Purpose:
+
+- resolves the many-to-many relationship between people and accounts
+
+Main columns:
+
+- `person_sk`
+- `account_sk`
+
+### 9.5 `FACT_ACCOUNT_SNAPSHOT`
+
+Purpose:
+
+- stores a current-date snapshot of active person-account relationships and account status
+
+Main columns:
+
+- `date_sk`
+- `person_sk`
+- `account_sk`
+- `status_flag`
+
+## 10. How To Run Or Review The SQL Flow
+
+The repository does not include source data load files, so the SQL flow should be reviewed as DDL and ELT logic unless sample data is provided separately.
+
+Recommended review order:
+
+1. run `sql/staging/stg-teradata.sql`
+2. load source-equivalent data into the staging tables
+3. run `sql/warehouse/DW.sql`
+4. ensure `DIM_DATE` is populated for the dates you need
+5. run `sql/warehouse/ELT-STG_TO_Dim_fact`
+6. validate dimension history, bridge rows, and fact snapshot results
+
+Suggested validation checks:
+
+- confirm one current row per business key in `DIM_PERSON`
+- confirm one current row per business key in `DIM_ACCOUNT`
+- confirm historical rows close correctly at `next effective date - 1`
+- confirm bridge rows resolve only to current dimension versions
+- confirm `FACT_ACCOUNT_SNAPSHOT` joins successfully to a `DIM_DATE` row for `CURRENT_DATE`
+
+## 11. How To Run Or Review The PySpark Flow
+
+The repository does not include packaging files, dependency manifests, or job submission scripts, so the Spark script should be treated as the core implementation artifact.
+
+Before running, configure or verify:
+
+- Spark with Hive support
+- Oracle JDBC driver availability
+- network access to the source Oracle database
+- HDFS access to the configured raw, curated, and gold paths
+- permissions to create Hive tables in the `gold` database
+
+Typical review or execution sequence:
+
+1. update JDBC credentials and connection details in `spark/pyspark_build_datalake.py`
+2. ensure the Oracle JDBC driver is available to Spark
+3. create the required HDFS base directories if needed
+4. ensure the Hive `gold` database exists if your environment requires manual creation
+5. submit the Spark job
+6. validate raw, curated, and gold outputs
+
+Suggested validation checks:
+
+- raw files are written to the expected HDFS paths
+- curated outputs contain normalized column names and deduplicated rows
+- `dim_person` and `dim_account` show correct SCD Type 2 behavior
+- `dim_person_iden` resolves identifiers to the correct person version
+- `fact_account_snapshot` contains the expected `snapshot_date`, `date_sk`, and `status_flag`
+
+## 12. Assumptions And Prerequisites
+
+The current repository implies several environment assumptions that are not fully documented in code comments or setup files.
+
+### 12.1 SQL Path Assumptions
+
+- a Teradata-compatible environment is available
+- staging data will be loaded externally
+- `DIM_DATE` will be populated externally before fact loading
+- identity columns and partition syntax are supported by the target SQL environment
+
+### 12.2 Spark Path Assumptions
+
+- Spark is configured with Hive support
+- the `gold` database exists or can be created automatically
+- Oracle JDBC connectivity is available
+- HDFS paths are valid and writable
+- source tables exist with names matching the script exactly
+
+## 13. Known Limitations
+
+The repository is strong as a design and implementation exercise, but several production-readiness items are not yet included.
+
+- no sample source datasets are included
+- no dependency file is included for the PySpark environment
+- no job submission script is included
+- no automated tests are included
+- no explicit instructions are included for creating or populating `DIM_DATE`
+- credentials are represented as placeholders in the Spark script
+- configuration values are hardcoded instead of parameterized
+- no data quality checks, audit logging, or error handling framework is included
+- the SQL and Spark flows are aligned conceptually, but there is no automated parity test between them
+
+## 14. Improvement Ideas
+
+If this repository were extended beyond the assignment, the next useful improvements would be:
+
+- move JDBC URL, credentials, HDFS paths, and database names into configuration
+- add sample data and expected output examples
+- add automated validation queries and data quality checks
+- add a script or notebook to populate `DIM_DATE`
+- add unit tests for SCD logic in Spark
+- add a runbook for local, cluster, and reviewer execution
+- add error handling, logging, and load metrics
+- widen data types where business identifiers may outgrow the current sample design
+
+## 15. Source Of Truth Files
+
+This documentation was derived from the current repository contents, especially:
+
+- `README.md`
+- `sql/design/PDM.sql`
+- `sql/staging/stg-teradata.sql`
+- `sql/warehouse/DW.sql`
+- `sql/warehouse/ELT-STG_TO_Dim_fact`
+- `spark/pyspark_build_datalake.py`
+
+## 16. Final Summary
+
+This repository demonstrates two aligned implementations of the same historical data modeling problem:
+
+- a Teradata-style dimensional warehouse in SQL
+- a PySpark medallion-style data lake pipeline
+
+Both implementations preserve business history, generate analytical structures, and support a current-date snapshot view of account-person relationships. The repo is best understood as a strong architecture and transformation exercise, with clear room for production hardening through parameterization, automation, validation, and deployment packaging.
